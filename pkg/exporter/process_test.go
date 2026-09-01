@@ -741,6 +741,22 @@ func TestExportingProcess_GetMsgSizeLimit(t *testing.T) {
 	assert.Equal(t, input.MaxMsgSize, exporter.GetMsgSizeLimit())
 }
 
+// TestInitExportingProcessWithContextCancelled checks that ctx bounds the time spent
+// establishing the connection to the collector.
+func TestInitExportingProcessWithContextCancelled(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	input := ExporterInput{
+		CollectorAddress:  listener.Addr().String(),
+		CollectorProtocol: listener.Addr().Network(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = InitExportingProcessWithContext(ctx, input)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestExportingProcess_CheckConnToCollector(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -909,17 +925,53 @@ func (h immediateHandshaker) HandshakeContext(ctx context.Context) error {
 func TestDTLSHandshakeTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
-		err := dtlsHandshake(stalledHandshaker{})
+		err := dtlsHandshake(context.Background(), stalledHandshaker{})
 		assert.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.Equal(t, dtlsHandshakeTimeout, time.Since(start))
 	})
 }
 
+func TestDTLSHandshakeContextCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- dtlsHandshake(ctx, stalledHandshaker{})
+		}()
+		// Cancel the context well before the handshake timeout expires.
+		time.Sleep(time.Second)
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-errCh:
+			assert.ErrorIs(t, err, context.Canceled)
+		default:
+			require.Fail(t, "Handshake was not aborted when the context was cancelled")
+		}
+	})
+}
+
+// TestDTLSHandshakeContextDeadline checks that a caller-provided deadline which is shorter
+// than dtlsHandshakeTimeout takes precedence.
+func TestDTLSHandshakeContextDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const timeout = 5 * time.Second
+		require.Less(t, timeout, dtlsHandshakeTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		start := time.Now()
+		err := dtlsHandshake(ctx, stalledHandshaker{})
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, timeout, time.Since(start))
+	})
+}
+
 func TestDTLSHandshakeCompleted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		assert.NoError(t, dtlsHandshake(immediateHandshaker{}))
+		assert.NoError(t, dtlsHandshake(context.Background(), immediateHandshaker{}))
 		handshakeErr := errors.New("handshake failure")
-		assert.ErrorIs(t, dtlsHandshake(immediateHandshaker{err: handshakeErr}), handshakeErr)
+		assert.ErrorIs(t, dtlsHandshake(context.Background(), immediateHandshaker{err: handshakeErr}), handshakeErr)
 	})
 }
 

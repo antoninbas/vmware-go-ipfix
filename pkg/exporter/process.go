@@ -168,11 +168,11 @@ type dtlsHandshaker interface {
 	HandshakeContext(ctx context.Context) error
 }
 
-// dtlsHandshake performs the DTLS handshake, aborting it if it takes longer than
-// dtlsHandshakeTimeout. pion/dtls v2 applied a default 30s timeout to the handshake
-// performed by Dial, while in v3 Handshake will block forever by default.
-func dtlsHandshake(conn dtlsHandshaker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), dtlsHandshakeTimeout)
+// dtlsHandshake performs the DTLS handshake, aborting it if ctx is done or if it takes
+// longer than dtlsHandshakeTimeout. pion/dtls v2 applied a default 30s timeout to the
+// handshake performed by Dial, while in v3 Handshake will block forever by default.
+func dtlsHandshake(ctx context.Context, conn dtlsHandshaker) error {
+	ctx, cancel := context.WithTimeout(ctx, dtlsHandshakeTimeout)
 	defer cancel()
 	return conn.HandshakeContext(ctx)
 }
@@ -181,7 +181,22 @@ func dtlsHandshake(conn dtlsHandshaker) error {
 // and tempRefTimeout(template refresh timeout). tempRefTimeout is applicable only
 // for collectors listening over UDP; unit is seconds. For TCP, you can pass any
 // value and it will be ignored. For UDP, if 0 is passed, 600s is used as the default.
+// It is equivalent to calling InitExportingProcessWithContext with a background context,
+// which means that establishing the connection to the collector is only bounded by the
+// relevant network timeouts.
 func InitExportingProcess(input ExporterInput) (*ExportingProcess, error) {
+	return InitExportingProcessWithContext(context.Background(), input)
+}
+
+// InitExportingProcessWithContext is the same as InitExportingProcess, except that ctx
+// can be used to bound the time spent establishing the connection to the collector
+// (including the TLS / DTLS handshake when applicable).
+// ctx only applies to the creation of the ExportingProcess: cancelling it after this
+// function returns has no effect on the returned ExportingProcess, which is stopped with
+// CloseConnToCollector.
+// One exception is resolving a DTLS collector address, for which the standard library
+// does not provide a context-aware function: that step ignores ctx.
+func InitExportingProcessWithContext(ctx context.Context, input ExporterInput) (*ExportingProcess, error) {
 	if input.CollectorProtocol != "tcp" && input.CollectorProtocol != "udp" {
 		return nil, fmt.Errorf("unsupported collector protocol: %s", input.CollectorProtocol)
 	}
@@ -195,7 +210,8 @@ func InitExportingProcess(input ExporterInput) (*ExportingProcess, error) {
 			if configErr != nil {
 				return nil, configErr
 			}
-			conn, err = tls.Dial(input.CollectorProtocol, input.CollectorAddress, config)
+			dialer := &tls.Dialer{Config: config}
+			conn, err = dialer.DialContext(ctx, input.CollectorProtocol, input.CollectorAddress)
 			if err != nil {
 				return nil, fmt.Errorf("cannot create the TLS connection to the Collector %q: %w", input.CollectorAddress, err)
 			}
@@ -256,14 +272,15 @@ func InitExportingProcess(input ExporterInput) (*ExportingProcess, error) {
 			// on the first Read / Write. We trigger it explicitly so that connection
 			// failures (e.g. certificate validation errors) are reported to the caller
 			// here, instead of when the first IPFIX message is sent.
-			if err := dtlsHandshake(dtlsConn); err != nil {
+			if err := dtlsHandshake(ctx, dtlsConn); err != nil {
 				dtlsConn.Close()
 				return nil, fmt.Errorf("error during DTLS handshake with the Collector %q: %w", udpAddr.String(), err)
 			}
 			conn = dtlsConn
 		}
 	} else {
-		conn, err = net.Dial(input.CollectorProtocol, input.CollectorAddress)
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, input.CollectorProtocol, input.CollectorAddress)
 		if err != nil {
 			return nil, fmt.Errorf("cannot create the connection to the Collector %q: %w", input.CollectorAddress, err)
 		}
