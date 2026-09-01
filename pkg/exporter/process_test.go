@@ -16,16 +16,19 @@ package exporter
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -636,11 +639,11 @@ func TestExportingProcessWithDTLS(t *testing.T) {
 		t.Error(err)
 		return
 	}
-	config := &dtls.Config{
-		Certificates:         []tls.Certificate{cert},
-		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
-	}
-	listener, err := dtls.Listen("udp", address, config)
+	listener, err := dtls.ListenWithOptions(
+		"udp", address,
+		dtls.WithCertificates(cert),
+		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
+	)
 	if err != nil {
 		t.Errorf("Cannot start dtls collecting process on %s: %v", listener.Addr().String(), err)
 		return
@@ -883,6 +886,41 @@ func TestSendDataRecords(t *testing.T) {
 			require.Fail(t, "Expected message not received")
 		}
 	}
+}
+
+// stalledHandshaker simulates a collector which starts a DTLS handshake and never
+// completes it: it only returns when the provided context is done.
+type stalledHandshaker struct{}
+
+func (h stalledHandshaker) HandshakeContext(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// immediateHandshaker simulates a handshake which completes right away.
+type immediateHandshaker struct {
+	err error
+}
+
+func (h immediateHandshaker) HandshakeContext(ctx context.Context) error {
+	return h.err
+}
+
+func TestDTLSHandshakeTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		err := dtlsHandshake(stalledHandshaker{})
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, dtlsHandshakeTimeout, time.Since(start))
+	})
+}
+
+func TestDTLSHandshakeCompleted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, dtlsHandshake(immediateHandshaker{}))
+		handshakeErr := errors.New("handshake failure")
+		assert.ErrorIs(t, dtlsHandshake(immediateHandshaker{err: handshakeErr}), handshakeErr)
+	})
 }
 
 func TestCalculateMaxMsgSize(t *testing.T) {

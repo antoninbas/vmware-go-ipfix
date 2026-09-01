@@ -16,14 +16,37 @@ package collector
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
+	"time"
 
-	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v3"
 	"k8s.io/klog/v2"
 )
+
+// dtlsHandshakeTimeout bounds the duration of the DTLS handshake with a client.
+const dtlsHandshakeTimeout = 30 * time.Second
+
+// dtlsHandshaker is implemented by *dtls.Conn, and lets us test dtlsHandshake without a
+// real DTLS connection.
+type dtlsHandshaker interface {
+	HandshakeContext(ctx context.Context) error
+}
+
+// dtlsHandshake performs the DTLS handshake, aborting it if it takes longer than
+// dtlsHandshakeTimeout. pion/dtls v2 applied a default 30s timeout to the handshake
+// performed by Accept, while in v3 Handshake will block forever by default. Without a
+// bound, a peer which starts a handshake and then stops responding would leave this
+// goroutine (along with the listener and the connection) around for the lifetime of the
+// process.
+func dtlsHandshake(conn dtlsHandshaker) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dtlsHandshakeTimeout)
+	defer cancel()
+	return conn.HandshakeContext(ctx)
+}
 
 func (cp *CollectingProcess) startUDPServer() {
 	var listener net.Listener
@@ -35,12 +58,12 @@ func (cp *CollectingProcess) startUDPServer() {
 		return
 	}
 	if cp.isEncrypted { // use DTLS
-		config, err := cp.createServerDTLSConfig()
+		options, err := cp.createServerDTLSOptions()
 		if err != nil {
 			klog.Error(err)
 			return
 		}
-		listener, err = dtls.Listen("udp", address, config)
+		listener, err = dtls.ListenWithOptions("udp", address, options...)
 		if err != nil {
 			klog.Error(err)
 			return
@@ -54,6 +77,14 @@ func (cp *CollectingProcess) startUDPServer() {
 			return
 		}
 		defer conn.Close()
+		// As of pion/dtls v3, Accept no longer performs the handshake: it happens lazily on
+		// the first Read / Write. We trigger it explicitly so that handshake failures (e.g.
+		// client certificate validation errors) are reported clearly here, instead of
+		// surfacing as an opaque read error below.
+		if err := dtlsHandshake(conn.(*dtls.Conn)); err != nil {
+			klog.ErrorS(err, "Error during DTLS handshake with client")
+			return
+		}
 		cp.wg.Add(1)
 		go func() {
 			defer cp.wg.Done()
@@ -173,7 +204,7 @@ func (cp *CollectingProcess) createUDPClient(addr string) *transportSession {
 	return session
 }
 
-func (cp *CollectingProcess) createServerDTLSConfig() (*dtls.Config, error) {
+func (cp *CollectingProcess) createServerDTLSOptions() ([]dtls.ServerOption, error) {
 	if cp.tlsMinVersion != 0 && cp.tlsMinVersion != tls.VersionTLS12 {
 		return nil, fmt.Errorf("DTLS 1.2 is the only supported version")
 	}
@@ -181,25 +212,30 @@ func (cp *CollectingProcess) createServerDTLSConfig() (*dtls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// If tlsConfig.CipherSuites is nil, cipherSuites should also be nil!
-	var cipherSuites []dtls.CipherSuiteID
-	for _, cipherSuite := range cp.tlsCipherSuites {
-		cipherSuites = append(cipherSuites, dtls.CipherSuiteID(cipherSuite))
+	options := []dtls.ServerOption{
+		dtls.WithCertificates(cert),
+		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 	}
-	config := &dtls.Config{
-		Certificates:         []tls.Certificate{cert},
-		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
-		CipherSuites:         cipherSuites,
+	// If cp.tlsCipherSuites is empty, we must not set the option at all, so that the pion
+	// defaults are used.
+	if len(cp.tlsCipherSuites) > 0 {
+		cipherSuites := make([]dtls.CipherSuiteID, 0, len(cp.tlsCipherSuites))
+		for _, cipherSuite := range cp.tlsCipherSuites {
+			cipherSuites = append(cipherSuites, dtls.CipherSuiteID(cipherSuite))
+		}
+		options = append(options, dtls.WithCipherSuites(cipherSuites...))
 	}
 	if cp.caCert == nil {
-		return config, nil
+		return options, nil
 	}
 	clientCAs := x509.NewCertPool()
 	ok := clientCAs.AppendCertsFromPEM(cp.caCert)
 	if !ok {
 		return nil, fmt.Errorf("failed to parse client CA certificate")
 	}
-	config.ClientAuth = dtls.RequireAndVerifyClientCert
-	config.ClientCAs = clientCAs
-	return config, nil
+	options = append(options,
+		dtls.WithClientAuth(dtls.RequireAndVerifyClientCert),
+		dtls.WithClientCAs(clientCAs),
+	)
+	return options, nil
 }

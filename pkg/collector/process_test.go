@@ -29,7 +29,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v3"
+	dtlsnet "github.com/pion/dtls/v3/pkg/net"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -772,11 +773,24 @@ func TestDTLSCollectingProcess(t *testing.T) {
 	if !ok {
 		t.Error("Failed to parse root certificate")
 	}
-	config := &dtls.Config{RootCAs: roots,
-		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret}
-	conn, err := dtls.Dial("udp", collectorAddr, config)
+	// We dial the socket ourselves and hand it to pion as a net.PacketConn, instead of
+	// using dtls.Dial which would leave the socket unconnected. This is what the exporter
+	// does: see InitExportingProcess. It matters here because the collector keys sessions
+	// by the source address of the datagrams it receives, and only a connected socket has
+	// a local address that is guaranteed to match that source address.
+	udpConn, err := net.DialUDP(collectorAddr.Network(), nil, collectorAddr)
+	require.NoError(t, err)
+	conn, err := dtls.ClientWithOptions(
+		dtlsnet.PacketConnFromConn(udpConn), collectorAddr,
+		dtls.WithRootCAs(roots),
+		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
+	)
 	require.NoError(t, err)
 	defer conn.Close()
+	// As of pion/dtls v3, the handshake is not performed when the connection is created,
+	// but lazily on the first Read / Write. We trigger it explicitly so that handshake
+	// errors are reported here.
+	require.NoError(t, conn.Handshake())
 	_, err = conn.Write(validTemplatePacket)
 	require.NoError(t, err)
 	<-cp.GetMsgChan()
