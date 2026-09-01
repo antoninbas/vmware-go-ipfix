@@ -36,19 +36,27 @@ type dtlsHandshaker interface {
 	HandshakeContext(ctx context.Context) error
 }
 
-// dtlsHandshake performs the DTLS handshake, aborting it if it takes longer than
-// dtlsHandshakeTimeout. pion/dtls v2 applied a default 30s timeout to the handshake
-// performed by Accept, while in v3 Handshake will block forever by default. Without a
-// bound, a peer which starts a handshake and then stops responding would leave this
-// goroutine (along with the listener and the connection) around for the lifetime of the
-// process.
-func dtlsHandshake(conn dtlsHandshaker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), dtlsHandshakeTimeout)
+// dtlsHandshake performs the DTLS handshake, aborting it if ctx is done or if it takes
+// longer than dtlsHandshakeTimeout. pion/dtls v2 applied a default 30s timeout to the
+// handshake performed by Accept, while in v3 Handshake will block forever by default.
+// Without a bound, a peer which starts a handshake and then stops responding would leave
+// this goroutine (along with the listener and the connection) around for the lifetime of
+// the process.
+func dtlsHandshake(ctx context.Context, conn dtlsHandshaker) error {
+	ctx, cancel := context.WithTimeout(ctx, dtlsHandshakeTimeout)
 	defer cancel()
 	return conn.HandshakeContext(ctx)
 }
 
 func (cp *CollectingProcess) startUDPServer() {
+	// This function must be tracked by cp.wg for its whole duration: it calls cp.wg.Add
+	// for the goroutines it starts, and Stop closes cp.messageChan as soon as cp.wg.Wait
+	// returns. Without this, a client connecting while the collecting process is being
+	// stopped could start a goroutine after cp.messageChan has been closed, and that
+	// goroutine would panic when publishing a message. This mirrors what startTCPServer
+	// does with its accept loop.
+	cp.wg.Add(1)
+	defer cp.wg.Done()
 	var listener net.Listener
 	var err error
 	var conn net.Conn
@@ -71,6 +79,20 @@ func (cp *CollectingProcess) startUDPServer() {
 		defer listener.Close()
 		cp.updateAddress(listener.Addr())
 		klog.Infof("Start dtls collecting process on %s", cp.netAddress)
+		// Now that this function is tracked by cp.wg, Stop cannot return until it does.
+		// Accept can only be interrupted by closing the listener, and the handshake below
+		// can only be interrupted by cancelling its context, so we need both: otherwise
+		// Stop would block until a client connects, or until the handshake times out.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			select {
+			case <-cp.stopChan:
+				listener.Close()
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 		conn, err = listener.Accept()
 		if err != nil {
 			klog.Error(err)
@@ -81,7 +103,7 @@ func (cp *CollectingProcess) startUDPServer() {
 		// the first Read / Write. We trigger it explicitly so that handshake failures (e.g.
 		// client certificate validation errors) are reported clearly here, instead of
 		// surfacing as an opaque read error below.
-		if err := dtlsHandshake(conn.(*dtls.Conn)); err != nil {
+		if err := dtlsHandshake(ctx, conn.(*dtls.Conn)); err != nil {
 			klog.ErrorS(err, "Error during DTLS handshake with client")
 			return
 		}
